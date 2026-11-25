@@ -1,0 +1,20 @@
+# ── AI Hub 데이터로 만든 이미지 (재배포 금지) ──
+originals/
+stimuli/
+psytoolkit_upload/
+*.mp4
+*.jpg
+*.jpeg
+
+# ── 참가자 원자료 (개인정보 보호) ──
+data_1123/
+PsyToolkitData_*.zip
+results/*.xlsx
+results/*.pdf
+
+# ── 시스템·편집기 파일 ──
+__pycache__/
+.ipynb_checkpoints/
+~$*
+.DS_Store
+Thumbs.db

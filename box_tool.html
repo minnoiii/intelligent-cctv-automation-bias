@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>박스 좌표 찍기 도구</title>
+<style>
+  body { font-family: sans-serif; margin: 0; background: #222; color: #eee; }
+  header { padding: 10px 16px; background: #333; display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  header label, header button { font-size: 14px; }
+  button { padding: 6px 12px; border: 0; border-radius: 6px; background: #4a7bd0; color: #fff; cursor: pointer; }
+  button.gray { background: #666; }
+  button.on { background: #e0a000; color: #000; }
+  main { display: flex; }
+  #list { width: 220px; background: #2b2b2b; height: calc(100vh - 56px); overflow: auto; }
+  #list div { padding: 8px 10px; border-bottom: 1px solid #3a3a3a; cursor: pointer; font-size: 13px; }
+  #list div.active { background: #4a7bd0; }
+  #list div .cnt { float: right; color: #aaa; }
+  #stage { flex: 1; padding: 12px; overflow: auto; height: calc(100vh - 80px); }
+  canvas { max-width: 100%; cursor: crosshair; background: #000; }
+  #info { font-size: 13px; color: #ccc; margin: 6px 0; }
+  #out { width: 100%; height: 70px; font-size: 12px; background: #111; color: #9f9; }
+</style>
+</head>
+<body>
+<header>
+  <label>① 사진 열기 (여러 장) <input type="file" id="imgs" accept="image/*" multiple></label>
+  <label>② (선택) scenes.csv 열기 <input type="file" id="csv" accept=".csv"></label>
+  <button id="modeBox" class="on">사람 박스 모드</button>
+  <button id="modeRoi" class="gray">감시 구역 모드 (침입)</button>
+  <button id="undo" class="gray">되돌리기</button>
+  <button id="clear" class="gray">이 사진 초기화</button>
+  <button id="save">③ CSV 다운로드</button>
+</header>
+<main>
+  <div id="list"></div>
+  <div id="stage">
+    <div id="info">사진을 열어 주세요.</div>
+    <canvas id="cv"></canvas>
+    <div id="info2" style="font-size:13px;color:#ccc;margin-top:6px">현재 사진 결과 (표의 boxes / roi 칸에 들어갈 값)</div>
+    <textarea id="out" readonly></textarea>
+  </div>
+</main>
+<script>
+// 데이터: 파일명 -> { img, boxes: [[x1,y1,x2,y2]], roi: [[x,y]] }
+const data = {};
+let order = [], cur = null, mode = 'box', pending = null, csvRows = null, csvHeader = null;
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+
+document.getElementById('imgs').onchange = e => {
+  for (const f of e.target.files) {
+    const img = new Image();
+    img.onload = () => {
+      if (!data[f.name]) { data[f.name] = { img, boxes: [], roi: [] }; order.push(f.name); order.sort(); }
+      else data[f.name].img = img;
+      renderList(); if (!cur) select(order[0]);
+    };
+    img.src = URL.createObjectURL(f);
+  }
+};
+
+// 아주 단순한 CSV 파서 (따옴표 지원)
+function parseCSV(text) {
+  const rows = []; let row = [], cell = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) { if (c === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; } else cell += c; }
+    else if (c === '"') q = true;
+    else if (c === ',') { row.push(cell); cell = ''; }
+    else if (c === '\n' || c === '\r') { if (c === '\r' && text[i + 1] === '\n') i++; row.push(cell); rows.push(row); row = []; cell = ''; }
+    else cell += c;
+  }
+  if (cell !== '' || row.length) { row.push(cell); rows.push(row); }
+  return rows.filter(r => r.some(x => x !== ''));
+}
+const esc = v => /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+
+document.getElementById('csv').onchange = async e => {
+  const t = (await e.target.files[0].text()).replace(/^﻿/, '');
+  const rows = parseCSV(t); csvHeader = rows[0]; csvRows = rows.slice(1);
+  const fi = csvHeader.indexOf('file'), bi = csvHeader.indexOf('boxes'), ri = csvHeader.indexOf('roi');
+  // 이미 적힌 좌표가 있으면 불러오기
+  for (const r of csvRows) {
+    const name = r[fi]; if (!name) continue;
+    if (!data[name]) { data[name] = { img: null, boxes: [], roi: [] }; order.push(name); }
+    if (r[bi]) data[name].boxes = r[bi].split('|').map(s => s.trim().split(/\s+/).map(Number)).filter(b => b.length === 4);
+    if (r[ri]) data[name].roi = r[ri].split(';').map(s => s.trim().split(/\s+/).map(Number)).filter(p => p.length === 2);
+  }
+  order.sort(); renderList();
+  alert('scenes.csv를 불러왔어요. 다운로드하면 이 표의 boxes / roi 칸이 채워져서 나와요.');
+};
+
+function renderList() {
+  const L = document.getElementById('list'); L.innerHTML = '';
+  for (const n of order) {
+    const d = document.createElement('div'); const v = data[n];
+    d.innerHTML = `${n}${v.img ? '' : ' (사진 없음)'}<span class="cnt">박스 ${v.boxes.length}${v.roi.length ? ' · 구역' : ''}</span>`;
+    if (n === cur) d.className = 'active';
+    d.onclick = () => select(n); L.appendChild(d);
+  }
+}
+function select(n) { cur = n; pending = null; renderList(); draw(); }
+
+function setMode(m) {
+  mode = m; pending = null;
+  document.getElementById('modeBox').className = m === 'box' ? 'on' : 'gray';
+  document.getElementById('modeRoi').className = m === 'roi' ? 'on' : 'gray';
+  draw();
+}
+document.getElementById('modeBox').onclick = () => setMode('box');
+document.getElementById('modeRoi').onclick = () => setMode('roi');
+
+function toImg(ev) {
+  const r = cv.getBoundingClientRect();
+  return [Math.round((ev.clientX - r.left) * cv.width / r.width), Math.round((ev.clientY - r.top) * cv.height / r.height)];
+}
+cv.onclick = ev => {
+  if (!cur || !data[cur].img) return;
+  const p = toImg(ev), d = data[cur];
+  if (mode === 'box') {
+    if (!pending) pending = p;
+    else {
+      d.boxes.push([Math.min(pending[0], p[0]), Math.min(pending[1], p[1]), Math.max(pending[0], p[0]), Math.max(pending[1], p[1])]);
+      pending = null;
+    }
+  } else d.roi.push(p);
+  renderList(); draw();
+};
+cv.onmousemove = ev => { if (pending) draw(toImg(ev)); };
+
+document.getElementById('undo').onclick = () => {
+  if (!cur) return; const d = data[cur];
+  if (pending) pending = null; else if (mode === 'box') d.boxes.pop(); else d.roi.pop();
+  renderList(); draw();
+};
+document.getElementById('clear').onclick = () => {
+  if (cur && confirm(cur + '의 박스와 구역을 모두 지울까요?')) { data[cur].boxes = []; data[cur].roi = []; pending = null; renderList(); draw(); }
+};
+
+const boxStr = d => d.boxes.map(b => b.join(' ')).join(' | ');
+const roiStr = d => d.roi.map(p => p.join(' ')).join('; ');
+
+function draw(hover) {
+  const info = document.getElementById('info'), out = document.getElementById('out');
+  if (!cur) return; const d = data[cur];
+  if (!d.img) { info.textContent = cur + ': 사진을 열어 주세요.'; return; }
+  cv.width = d.img.naturalWidth; cv.height = d.img.naturalHeight;
+  ctx.drawImage(d.img, 0, 0);
+  const lw = Math.max(1, cv.width / 900);
+  // 감시 구역 (노란 점선)
+  if (d.roi.length) {
+    ctx.setLineDash([lw * 5, lw * 4]); ctx.strokeStyle = '#ffd200'; ctx.lineWidth = lw;
+    ctx.beginPath(); d.roi.forEach((p, i) => i ? ctx.lineTo(...p) : ctx.moveTo(...p));
+    if (d.roi.length > 2) ctx.closePath(); ctx.stroke(); ctx.setLineDash([]);
+    d.roi.forEach(p => { ctx.fillStyle = '#ffd200'; ctx.fillRect(p[0] - lw * 2, p[1] - lw * 2, lw * 4, lw * 4); });
+  }
+  // 사람 박스 (빨간 실선)
+  ctx.strokeStyle = '#e61e1e'; ctx.lineWidth = lw;
+  d.boxes.forEach((b, i) => {
+    ctx.strokeRect(b[0], b[1], b[2] - b[0], b[3] - b[1]);
+    ctx.fillStyle = '#e61e1e'; ctx.font = `${lw * 8}px sans-serif`; ctx.fillText(String(i + 1), b[0] + lw, b[1] - lw * 2);
+  });
+  if (pending) {
+    ctx.fillStyle = '#e61e1e'; ctx.fillRect(pending[0] - lw * 2, pending[1] - lw * 2, lw * 4, lw * 4);
+    if (hover) { ctx.setLineDash([lw * 3, lw * 3]); ctx.strokeRect(pending[0], pending[1], hover[0] - pending[0], hover[1] - pending[1]); ctx.setLineDash([]); }
+  }
+  info.textContent = `${cur} (${cv.width}×${cv.height}) · ` + (mode === 'box'
+    ? (pending ? '이제 그 사람의 오른쪽 아래 모서리를 클릭하세요.' : '사람의 왼쪽 위 모서리를 클릭하세요.')
+    : '감시 구역 꼭짓점을 순서대로 클릭하세요 (보통 4개).');
+  out.value = `boxes: ${boxStr(d)}\nroi: ${roiStr(d)}`;
+}
+
+document.getElementById('save').onclick = () => {
+  let text;
+  if (csvRows) {
+    const fi = csvHeader.indexOf('file'), bi = csvHeader.indexOf('boxes'), ri = csvHeader.indexOf('roi');
+    const rows = csvRows.map(r => { const d = data[r[fi]]; if (d) { r[bi] = boxStr(d); r[ri] = roiStr(d); } return r; });
+    text = [csvHeader, ...rows].map(r => r.map(c => esc(c || '')).join(',')).join('\n');
+  } else {
+    text = 'file,boxes,roi\n' + order.map(n => [n, boxStr(data[n]), roiStr(data[n])].map(esc).join(',')).join('\n');
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob(['﻿' + text], { type: 'text/csv' }));
+  a.download = 'scenes_filled.csv'; a.click();
+};
+</script>
+</body>
+</html>
